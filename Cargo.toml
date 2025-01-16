@@ -9,8 +9,9 @@ volatile = "0.2.6"
 lazy_static = { version = "1.0", features = ["spin_no_std"] }
 spin = "0.5.2"
 uart_16550 = "0.2.0"
+x86_64 = "0.14.2"
 
 [package.metadata.bootimage]
 run-args = [
-    "-serial", "stdio"
+    "-serial", "stdio",
 ]
