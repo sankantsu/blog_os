@@ -14,6 +14,6 @@ fn panic(_info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     vga_buffer::print_something();
-    serial::print("Hello, serial port!");
+    serial_println!("Hello, serial port!");
     loop {}
 }
