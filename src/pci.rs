@@ -13,7 +13,7 @@ fn read_config_data() -> u32 {
     unsafe { port.read() }
 }
 
-struct ClassCode {
+pub struct ClassCode {
     class_code: u8,
     subclass: u8,
     prog_if: u8,
@@ -49,6 +49,9 @@ impl ClassCode {
     pub fn is_pci_to_pci_bridge(&self) -> bool {
         self.class_code == 0x06 && self.subclass == 0x04
     }
+    pub fn is_xhci_controller(&self) -> bool {
+        self.class_code == 0x0c && self.subclass == 0x03 && self.prog_if == 0x30
+    }
 }
 
 impl core::fmt::Debug for ClassCode {
@@ -64,7 +67,7 @@ impl core::fmt::Debug for ClassCode {
     }
 }
 
-struct VendorId {
+pub struct VendorId {
     vendor: u16,
 }
 
@@ -81,21 +84,22 @@ impl VendorId {
     }
 }
 
-struct PCIConfigurationReader {
+#[derive(Clone, Copy, Debug)]
+pub struct PCIAddress {
     bus_num: u8,
     device_num: u8,
     function_num: u8,
 }
 
-impl PCIConfigurationReader {
+impl PCIAddress {
     pub fn new(bus_num: u8, device_num: u8, function_num: u8) -> Self {
-        PCIConfigurationReader {
+        PCIAddress {
             bus_num,
             device_num,
             function_num,
         }
     }
-    fn make_address(&self, offset: u8) -> u32 {
+    fn make_config_address(&self, offset: u8) -> u32 {
         1 << 31
             | (self.bus_num as u32) << 16
             | (self.device_num as u32) << 11
@@ -104,7 +108,7 @@ impl PCIConfigurationReader {
     }
     fn read_data_at(&self, offset: u8) -> u32 {
         assert_eq!(offset % 4, 0); // must be 32bit aligned
-        let address = self.make_address(offset);
+        let address = self.make_config_address(offset);
         write_config_address(address);
         let data = read_config_data();
         data
@@ -142,7 +146,7 @@ impl PCIConfigurationReader {
 }
 
 fn log_pci_function(bus_num: u8, device_num: u8, function_num: u8) {
-    let config_reader = PCIConfigurationReader::new(bus_num, device_num, function_num);
+    let config_reader = PCIAddress::new(bus_num, device_num, function_num);
     let vendor_id = config_reader.read_vendor_id();
     if vendor_id.is_invalid() {
         // crate::serial_println!("{}.{}.{}: Invalid", bus_num, device_num, function_num);
@@ -161,57 +165,107 @@ fn log_pci_function(bus_num: u8, device_num: u8, function_num: u8) {
     );
 }
 
+const MAX_PCI_DEVICE: usize = 32;
+
+pub struct PCIBusScanner {
+    // FIXME: Implement memory allocator and use Vec instead
+    initialized: bool,
+    n_devices: usize,
+    found_addresses: [PCIAddress; MAX_PCI_DEVICE],
+}
+
+// Implement recursive bus scan
 // see: https://wiki.osdev.org/PCI#Recursive_Scan
-pub fn scan_all() {
-    let host_bridge_config = PCIConfigurationReader::new(0, 0, 0);
-    if host_bridge_config.is_single_function() {
-        scan_bus(0);
-        return;
-    }
-    // multiple host controllers
-    for function_num in 0..8 {
-        // responsible for bus: bus_num = function_num
-        let config = PCIConfigurationReader::new(0, 0, function_num);
-        if config.read_vendor_id().is_invalid() {
-            break;
+impl PCIBusScanner {
+    pub fn new() -> Self {
+        Self {
+            initialized: false,
+            n_devices: 0,
+            found_addresses: [PCIAddress {
+                bus_num: 0,
+                device_num: 0,
+                function_num: 0,
+            }; MAX_PCI_DEVICE],
         }
-        let bus_num = function_num;
-        scan_bus(bus_num);
     }
-}
-
-fn scan_bus(bus_num: u8) {
-    for device_num in 0..32 {
-        scan_device(bus_num, device_num);
-    }
-}
-
-fn scan_device(bus_num: u8, device_num: u8) {
-    // Every device must implement function 0
-    let config = PCIConfigurationReader::new(bus_num, device_num, 0);
-    if config.read_vendor_id().is_invalid() {
-        // Skip non-existing device
-        return;
-    }
-    scan_function(bus_num, device_num, 0);
-
-    // Check multi function
-    if !config.is_single_function() {
-        for function_num in 1..8 {
+    pub fn scan_all(&mut self) {
+        let host_bridge_config = PCIAddress::new(0, 0, 0);
+        if host_bridge_config.is_single_function() {
+            self.scan_bus(0);
+            self.initialized = true;
+            return;
+        }
+        // multiple host controllers
+        for function_num in 0..8 {
+            // responsible for bus: bus_num = function_num
+            let config = PCIAddress::new(0, 0, function_num);
             if config.read_vendor_id().is_invalid() {
-                continue;
+                break;
             }
-            scan_function(bus_num, device_num, function_num);
+            let bus_num = function_num;
+            self.scan_bus(bus_num);
+        }
+        self.initialized = true;
+    }
+
+    fn scan_bus(&mut self, bus_num: u8) {
+        for device_num in 0..32 {
+            self.scan_device(bus_num, device_num);
         }
     }
-}
 
-fn scan_function(bus_num: u8, device_num: u8, function_num: u8) {
-    log_pci_function(bus_num, device_num, function_num);
+    fn scan_device(&mut self, bus_num: u8, device_num: u8) {
+        // Every device must implement function 0
+        let config = PCIAddress::new(bus_num, device_num, 0);
+        if config.read_vendor_id().is_invalid() {
+            // Skip non-existing device
+            return;
+        }
+        self.scan_function(bus_num, device_num, 0);
 
-    let config = PCIConfigurationReader::new(bus_num, device_num, function_num);
-    if config.read_class_code().is_pci_to_pci_bridge() {
-        let secondary_bus = config.read_secondary_bus_num();
-        scan_bus(secondary_bus);
+        // Check multi function
+        if !config.is_single_function() {
+            for function_num in 1..8 {
+                if config.read_vendor_id().is_invalid() {
+                    continue;
+                }
+                self.scan_function(bus_num, device_num, function_num);
+            }
+        }
+    }
+
+    fn scan_function(&mut self, bus_num: u8, device_num: u8, function_num: u8) {
+        log_pci_function(bus_num, device_num, function_num);
+        self.add_function(bus_num, device_num, function_num);
+
+        let config = PCIAddress::new(bus_num, device_num, function_num);
+        if config.read_class_code().is_pci_to_pci_bridge() {
+            let secondary_bus = config.read_secondary_bus_num();
+            self.scan_bus(secondary_bus);
+        }
+    }
+
+    fn add_function(&mut self, bus_num: u8, device_num: u8, function_num: u8) {
+        if self.n_devices == MAX_PCI_DEVICE {
+            // Device array is full
+            return;
+        }
+        self.found_addresses[self.n_devices] = PCIAddress {
+            bus_num,
+            device_num,
+            function_num,
+        };
+        self.n_devices += 1;
+    }
+
+    pub fn get_xhci_controller_address(&self) -> Option<PCIAddress> {
+        assert!(self.initialized);
+        for addr in &self.found_addresses {
+            let class_code = addr.read_class_code();
+            if class_code.is_xhci_controller() {
+                return Some(addr.clone());
+            }
+        }
+        None
     }
 }

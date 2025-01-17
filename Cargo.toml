@@ -13,5 +13,6 @@ x86_64 = "0.14.2"
 
 [package.metadata.bootimage]
 run-args = [
+    "-device", "qemu-xhci",
     "-serial", "stdio",
 ]
